@@ -153,11 +153,15 @@ def make_moe_config(
     experts: GroupedExperts.Config,
     shared_experts: FeedForward.Config | None = None,
     load_balance_coeff: float | None = 1e-3,
+    aux_loss_coeff: float | None = None,
+    seq_aux_loss_coeff: float | None = None,
 ) -> MoE.Config:
     """Build a fully-specified MoE.Config."""
     return MoE.Config(
         num_experts=num_experts,
         load_balance_coeff=load_balance_coeff,
+        aux_loss_coeff=aux_loss_coeff,
+        seq_aux_loss_coeff=seq_aux_loss_coeff,
         router=router,
         experts=experts,
         shared_experts=shared_experts,

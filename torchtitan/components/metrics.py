@@ -526,9 +526,14 @@ class MetricsProcessor(Configurable):
 
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        aux_loss_str = ""
+        if extra_metrics and "loss_metrics/moe_aux_loss" in extra_metrics:
+            aux_loss_str = (
+                f"  {color.yellow}aux_loss: {extra_metrics['loss_metrics/moe_aux_loss']:.6f}"
+            )
         logger.info(
             f"{color.red}step: {step:2}  "
-            f"{color.green}loss: {global_avg_loss:8.5f}  "
+            f"{color.green}loss: {global_avg_loss:8.5f}{aux_loss_str}  "
             f"{color.orange}grad_norm: {grad_norm:7.4f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "

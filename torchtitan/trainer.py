@@ -45,6 +45,7 @@ from torchtitan.distributed.context_parallel import prepare_context_parallel_inp
 
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import collect_moe_aux_loss
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
@@ -448,6 +449,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
         self.ntokens_seen = 0
+        self._last_step_aux_losses: list[float] = []
 
         self.checkpointer = config.checkpoint.build(
             dataloader=self.dataloader,
@@ -467,6 +469,27 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             parallel_dims.tp_enabled and not config.parallelism.disable_loss_parallel
         )
         self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
+
+        # MoE auxiliary loss is not yet supported with Pipeline Parallelism or Expert Parallelism.
+        from torchtitan.models.common.moe import MoE
+        for model_part in self.model_parts:
+            for module in model_part.modules():
+                if isinstance(module, MoE) and (
+                    module.aux_loss_coeff is not None
+                    or module.seq_aux_loss_coeff is not None
+                ):
+                    if parallel_dims.pp_enabled:
+                        raise RuntimeError(
+                            "MoE auxiliary loss (aux_loss_coeff / seq_aux_loss_coeff) "
+                            "is not supported with Pipeline Parallelism. "
+                            "Please disable Pipeline Parallel or auxiliary loss."
+                        )
+                    if parallel_dims.ep_enabled:
+                        raise RuntimeError(
+                            "MoE auxiliary loss (aux_loss_coeff / seq_aux_loss_coeff) "
+                            "is not supported with Expert Parallelism. "
+                            "Please disable Expert Parallel or auxiliary loss."
+                        )
 
         # Build validator if validation is configured
         if config.validator.enable:
@@ -703,7 +726,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     pred = pred.to_local()
                 loss = self.loss_fn(pred, labels, global_valid_tokens)
                 del pred
+                # Collect and add MOE auxiliary loss if present.
+                aux_loss = collect_moe_aux_loss(model_parts[0], clear=True)
+                if aux_loss is not None:
+                    loss = loss + aux_loss
+                    self._last_step_aux_losses.append(aux_loss.detach().item())
+                    logger.debug(
+                        f"[aux_loss] step={self.step} microbatch collected aux_loss={aux_loss.detach().item():.6f}"
+                    )
                 loss.backward()
+                # Clear any auxiliary losses that may have been accumulated during
+                # activation checkpointing recomputation to avoid polluting the next microbatch.
+                collect_moe_aux_loss(model_parts[0], clear=True)
 
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
@@ -739,6 +773,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             global_valid_tokens = local_valid_tokens.float()
 
         # Process each microbatch: move to GPU, forward/backward, then free
+        self._last_step_aux_losses.clear()
+        # Defensively clear any stale auxiliary losses before starting the step.
+        for model_part in self.model_parts:
+            collect_moe_aux_loss(model_part, clear=True)
         accumulated_losses = []
         for input_dict, labels in microbatches:
             # Move tensors to GPU
@@ -810,6 +848,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+
+        # Report MOE auxiliary loss if collected during this step.
+        if self._last_step_aux_losses:
+            avg_aux_loss = sum(self._last_step_aux_losses) / len(
+                self._last_step_aux_losses
+            )
+            if parallel_dims.dp_cp_enabled:
+                # avg_aux_loss is already averaged locally; we need the global mean across ranks.
+                avg_aux_loss = dist_utils.dist_mean(
+                    torch.tensor(avg_aux_loss, device=self.device), loss_mesh
+                )
+            extra_metrics["loss_metrics/moe_aux_loss"] = float(avg_aux_loss)
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

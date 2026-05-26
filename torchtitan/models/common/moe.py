@@ -199,7 +199,7 @@ class TokenChoiceTopKRouter(Module):
 
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x (torch.Tensor): Input tensor with shape ``(bs*slen, dim)``.
@@ -207,13 +207,15 @@ class TokenChoiceTopKRouter(Module):
                 Used for load balancing. Defaults to None.
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
                 - top_scores (torch.Tensor):
                     Routing scores for selected experts with shape ``(bs*slen, top_k)``.
                 - selected_experts_indices (torch.Tensor):
                     Expert indices selected for each token with shape ``(bs*slen, top_k)``.
                 - num_tokens_per_expert (torch.Tensor):
                     Number of tokens assigned to each expert with shape ``(num_experts,)``.
+                - scores (torch.Tensor):
+                    Routing scores for all experts with shape ``(bs*slen, num_experts)``.
         """
         # scores shape (bs*slen, num_experts)
         # Compute gate in float32 to help stability of expert load balancing.
@@ -255,14 +257,12 @@ class TokenChoiceTopKRouter(Module):
         top_scores = top_scores * self.route_scale
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        )
+        flat_indices = selected_experts_indices.view(-1)
+        num_tokens_per_expert = torch.bincount(
+            flat_indices, minlength=self.num_experts
+        ).float()
 
-        return top_scores, selected_experts_indices, num_tokens_per_expert
+        return top_scores, selected_experts_indices, num_tokens_per_expert, scores
 
 
 class MoE(Module):
@@ -292,6 +292,8 @@ class MoE(Module):
         experts: GroupedExperts.Config
         router: TokenChoiceTopKRouter.Config
         load_balance_coeff: float | None = 1e-3
+        aux_loss_coeff: float | None = None
+        seq_aux_loss_coeff: float | None = None
         shared_experts: FeedForward.Config | None = None
 
     def __init__(self, config: Config):
@@ -309,6 +311,20 @@ class MoE(Module):
         #       expert_bias is updated outside the model in an optimizer step pre hook
         #       to work with gradient accumulation.
         self.load_balance_coeff = config.load_balance_coeff
+        self.aux_loss_coeff = config.aux_loss_coeff
+        self.seq_aux_loss_coeff = config.seq_aux_loss_coeff
+
+        # Enforce mutual exclusivity: loss-based load balancing takes priority.
+        if self.aux_loss_coeff is not None or self.seq_aux_loss_coeff is not None:
+            if self.load_balance_coeff is not None:
+                import warnings
+                warnings.warn(
+                    "MoE auxiliary loss (aux_loss_coeff / seq_aux_loss_coeff) is enabled. "
+                    "Disabling auxiliary-loss-free load balancing (load_balance_coeff) to avoid conflicting signals.",
+                    stacklevel=2,
+                )
+                self.load_balance_coeff = None
+
         if self.load_balance_coeff is not None:
             assert self.load_balance_coeff > 0.0
             self.register_buffer(
@@ -324,6 +340,10 @@ class MoE(Module):
             torch.zeros(num_experts, dtype=torch.float32),
             persistent=False,
         )
+        # _aux_losses stores per-forward auxiliary losses for load balancing.
+        # Using a Python list avoids torch.compile issues with buffer mutations
+        # under activation checkpointing.
+        self._aux_losses: list[torch.Tensor] = []
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -349,6 +369,7 @@ class MoE(Module):
             top_scores,
             selected_experts_indices,
             num_tokens_per_expert,
+            scores,
         ) = self.router(x, self.expert_bias)
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
@@ -358,6 +379,17 @@ class MoE(Module):
         #       effect on the expert bias update thanks to the torch.sign() operator.
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
+
+        # Compute auxiliary loss for load balancing if configured.
+        # Reference: Megatron-LM switch_load_balancing_loss_func
+        if self.aux_loss_coeff is not None or self.seq_aux_loss_coeff is not None:
+            self._compute_and_store_aux_loss(
+                scores,
+                selected_experts_indices,
+                num_tokens_per_expert,
+                bs,
+                slen,
+            )
 
         out = self.experts(x, top_scores, selected_experts_indices)
 
@@ -379,6 +411,64 @@ class MoE(Module):
             out = out + shared_out
         return out.reshape(bs, slen, dim)
 
+    def _compute_and_store_aux_loss(
+        self,
+        scores: torch.Tensor,
+        selected_experts_indices: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        bs: int,
+        slen: int,
+    ) -> None:
+        """Compute micro-batch and/or sequence-level auxiliary losses.
+
+        Megatron's compute_routing_scores_for_aux_loss uses the original
+        scores without expert_bias. We mirror that here.
+        """
+        if self.expert_bias is not None:
+            _, selected_experts_indices_aux = torch.topk(
+                scores, k=self.router.top_k, dim=-1, sorted=False
+            )
+            flat_indices_aux = selected_experts_indices_aux.view(-1)
+            num_tokens_per_expert_aux = torch.bincount(
+                flat_indices_aux, minlength=self.router.num_experts
+            ).float()
+        else:
+            selected_experts_indices_aux = selected_experts_indices
+            num_tokens_per_expert_aux = num_tokens_per_expert
+
+        total_num_tokens = bs * slen
+        num_experts = self.router.num_experts
+        topk = self.router.top_k
+
+        if self.aux_loss_coeff is not None:
+            # micro-batch level aux loss
+            aggregated_probs = scores.sum(dim=0)  # (num_experts,)
+            aux_loss = (
+                torch.sum(aggregated_probs * num_tokens_per_expert_aux)
+                * num_experts
+                * self.aux_loss_coeff
+                / (topk * total_num_tokens * total_num_tokens)
+            )
+            self._aux_losses.append(aux_loss)
+
+        if self.seq_aux_loss_coeff is not None:
+            # sequence-level aux loss (DeepSeek-V2/V3 style)
+            scores_reshaped = scores.view(bs, slen, num_experts)
+            # Build per-sequence tokens-per-expert from selected indices
+            routing_map = torch.nn.functional.one_hot(
+                selected_experts_indices_aux, num_classes=num_experts
+            ).sum(dim=1).to(scores.dtype)
+            routing_map = routing_map.view(bs, slen, num_experts)
+            tokens_per_expert_per_seq = routing_map.sum(dim=1)  # (bs, num_experts)
+            probs_per_seq = scores_reshaped.sum(dim=1)  # (bs, num_experts)
+            seq_aux_loss = (
+                torch.sum(probs_per_seq * tokens_per_expert_per_seq, dim=1)
+                * num_experts
+                * self.seq_aux_loss_coeff
+                / (topk * slen * slen)
+            ).sum() / bs
+            self._aux_losses.append(seq_aux_loss)
+
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         assert isinstance(buffer_device, torch.device)
 
@@ -386,7 +476,33 @@ class MoE(Module):
             self.tokens_per_expert = torch.zeros(
                 self.experts.num_experts, dtype=torch.float32
             )
+            self._aux_losses.clear()
             if self.load_balance_coeff is not None:
                 self.expert_bias = torch.zeros(
                     self.experts.num_experts, dtype=torch.float32
                 )
+
+
+def collect_moe_aux_loss(model: nn.Module, clear: bool = True) -> torch.Tensor | None:
+    """Collect and optionally clear accumulated MOE auxiliary losses from a model.
+
+    Args:
+        model: The model to collect aux losses from.
+        clear: If True, clear the aux_loss lists after collection.
+
+    Returns:
+        Total auxiliary loss tensor, or None if no MoE layers have accumulated aux loss.
+    """
+    all_aux_losses: list[torch.Tensor] = []
+    for module in model.modules():
+        if isinstance(module, MoE) and hasattr(module, "_aux_losses"):
+            all_aux_losses.extend(module._aux_losses)
+    if not all_aux_losses:
+        return None
+    # Use Python sum to avoid creating an unnecessary torch.stack node.
+    total_aux_loss = sum(all_aux_losses)
+    if clear:
+        for module in model.modules():
+            if isinstance(module, MoE) and hasattr(module, "_aux_losses"):
+                module._aux_losses.clear()
+    return total_aux_loss

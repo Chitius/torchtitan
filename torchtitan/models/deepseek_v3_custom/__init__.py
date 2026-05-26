@@ -173,6 +173,7 @@ def _build_dsv3_layers(
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None,
+    seq_aux_loss_coeff: float | None = None,
 ) -> list[TransformerBlock.Config]:
     """Build the list of per-layer TransformerBlock configs.
 
@@ -236,6 +237,9 @@ def _build_dsv3_layers(
                     w1_param_init=_LINEAR_INIT,
                     w2w3_param_init=_depth_init(layer_id),
                 ),
+                # When loss-based load balancing is enabled, disable loss-free balancing.
+                load_balance_coeff=None if seq_aux_loss_coeff is not None else 1e-3,
+                seq_aux_loss_coeff=seq_aux_loss_coeff,
             )
 
         layers.append(
@@ -251,6 +255,74 @@ def _build_dsv3_layers(
         )
     return layers
 
+def _500m(
+    attn_backend: str,
+    moe_comm_backend: str,
+    non_blocking_capacity_factor: float | None = None,
+) -> DeepSeekV3CustomModel.Config:
+    dim = 768
+    n_layers = 10
+    vocab_size = 129280
+    n_heads = 12
+    moe_hidden_dim = 512
+    num_shared_experts = 1
+    dense_hidden_dim = 4096
+    rope_dim = 64
+    num_experts = 24
+    n_dense_layers = 2
+
+    layers = _build_dsv3_layers(
+        n_layers=n_layers,
+        n_dense_layers=n_dense_layers,
+        dim=dim,
+        n_heads=n_heads,
+        q_lora_rank=768,
+        kv_lora_rank=256,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=64,
+        mscale=0.70,
+        dense_hidden_dim=dense_hidden_dim,
+        moe_hidden_dim=moe_hidden_dim,
+        num_experts=num_experts,
+        num_shared_experts=num_shared_experts,
+        router_top_k=4,
+        router_score_func="sigmoid",
+        router_num_expert_groups=4,
+        router_num_limited_groups=2,
+        router_route_scale=2.5,
+        router_route_norm=True,
+        score_before_experts=False,
+        attn_backend=attn_backend,
+        moe_comm_backend=moe_comm_backend,
+        non_blocking_capacity_factor=non_blocking_capacity_factor,
+        seq_aux_loss_coeff=1e-4,
+    )
+    return DeepSeekV3CustomModel.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=rope_dim,
+            max_seq_len=4096,
+            theta=10000.0,
+            backend="complex",
+            scaling="yarn",
+            rope_factor=1.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            original_seq_len=4096,
+        ),
+        layers=layers,
+    )
 
 def _3b(
     attn_backend: str = "sdpa",
@@ -292,6 +364,7 @@ def _3b(
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        seq_aux_loss_coeff=1e-4,
     )
     return DeepSeekV3CustomModel.Config(
         vocab_size=vocab_size,

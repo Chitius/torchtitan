@@ -89,12 +89,10 @@ class LocalTokenDispatcher(Configurable):
             top_scores_experts_sorted: (num_tokens * top_k,) scores in expert-sorted order
         """
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        )
+        flat_indices = selected_experts_indices.view(-1)
+        num_tokens_per_expert = torch.bincount(
+            flat_indices, minlength=self.num_experts
+        ).float()
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
