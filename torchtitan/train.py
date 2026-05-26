@@ -63,6 +63,16 @@ def main() -> None:
             logger.info("Created seed checkpoint")
         else:
             trainer.train()
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user (Ctrl+C).")
+        if trainer:
+            logger.info(f"Saving emergency checkpoint at step {trainer.step}...")
+            trainer.checkpointer.save(curr_step=trainer.step, last_step=True)
+            trainer.close()
+        if torch.distributed.is_initialized():
+            with sl.log_trace_span("torch_distributed_teardown"):
+                torch.distributed.destroy_process_group()
+        logger.info("Graceful shutdown completed.")
     except Exception:
         if trainer:
             trainer.close()

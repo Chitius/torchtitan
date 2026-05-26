@@ -300,6 +300,9 @@ class MetricsProcessor(Configurable):
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
 
+        peak_flops: float | None = None
+        """Manually override peak FLOPS for MFU calculation (e.g. 989e12 for H200). If None, auto-detect from device name."""
+
     config: Config
     logger: BaseLogger
     parallel_dims: ParallelDims

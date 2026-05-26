@@ -11,7 +11,6 @@ from typing import Literal
 import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import Embedding, Linear, RMSNorm, RoPE, TransformerBlock
 from torchtitan.models.common.config_utils import (
     get_attention_config,
@@ -25,19 +24,19 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .model import Attention, DeepSeekV3Model, DeepSeekV3TransformerBlock
-from .parallelize import parallelize_deepseekv3
-from .state_dict_adapter import DeepSeekV3StateDictAdapter
+from .model import Attention, DeepSeekV3CustomModel, DeepSeekV3CustomTransformerBlock
+from .parallelize import parallelize_deepseekv3_custom
+from .state_dict_adapter import DeepSeekV3CustomStateDictAdapter
 
 __all__ = [
-    "parallelize_deepseekv3",
-    "DeepSeekV3Model",
-    "deepseekv3_configs",
+    "parallelize_deepseekv3_custom",
+    "DeepSeekV3CustomModel",
+    "deepseekv3_custom_configs",
 ]
 
 
 _LINEAR_INIT = {
-    "weight": partial(nn.init.trunc_normal_, std=0.02),
+    "weight": partial(nn.init.trunc_normal_, std=0.006),
     "bias": nn.init.zeros_,
 }
 _NORM_INIT = {"weight": nn.init.ones_}
@@ -54,16 +53,16 @@ def _output_linear_init(dim: int) -> dict[str, Callable]:
 
 def _depth_init(layer_id: int) -> dict[str, Callable]:
     return {
-        "weight": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        "weight": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.006, layer_id)),
         "bias": nn.init.zeros_,
     }
 
 
 def _depth_experts_init(layer_id: int) -> dict[str, Callable]:
     return {
-        "w1": partial(nn.init.trunc_normal_, std=0.02),
-        "w2": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
-        "w3": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        "w1": partial(nn.init.trunc_normal_, std=0.006),
+        "w2": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.006, layer_id)),
+        "w3": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.006, layer_id)),
     }
 
 
@@ -240,7 +239,7 @@ def _build_dsv3_layers(
             )
 
         layers.append(
-            DeepSeekV3TransformerBlock.Config(
+            DeepSeekV3CustomTransformerBlock.Config(
                 attention=attn_cfg,
                 attention_norm=RMSNorm.Config(
                     normalized_shape=dim, param_init=_NORM_INIT
@@ -253,83 +252,19 @@ def _build_dsv3_layers(
     return layers
 
 
-def _debugmodel(
-    attn_backend: str,
-    moe_comm_backend: str,
+def _3b(
+    attn_backend: str = "sdpa",
+    moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
-) -> DeepSeekV3Model.Config:
-    dim = 256
-    n_layers = 6
-    vocab_size = 2048
+) -> DeepSeekV3CustomModel.Config:
+    """DeepSeek-V3 3B preset"""
+    dim = 1280
+    n_layers = 12
+    vocab_size = 129280
     n_heads = 16
-    moe_hidden_dim = 256
+    moe_hidden_dim = 896
     num_shared_experts = 2
-    dense_hidden_dim = 1024
-    rope_dim = 64
-    num_experts = 8
-    n_dense_layers = 1
-
-    layers = _build_dsv3_layers(
-        n_layers=n_layers,
-        n_dense_layers=n_dense_layers,
-        dim=dim,
-        n_heads=n_heads,
-        q_lora_rank=0,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=rope_dim,
-        v_head_dim=128,
-        mscale=0.70,
-        dense_hidden_dim=dense_hidden_dim,
-        moe_hidden_dim=moe_hidden_dim,
-        num_experts=num_experts,
-        num_shared_experts=num_shared_experts,
-        router_top_k=3,
-        router_score_func="softmax",
-        score_before_experts=False,
-        attn_backend=attn_backend,
-        moe_comm_backend=moe_comm_backend,
-        non_blocking_capacity_factor=non_blocking_capacity_factor,
-    )
-    return DeepSeekV3Model.Config(
-        vocab_size=vocab_size,
-        dim=dim,
-        tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
-        ),
-        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        lm_head=Linear.Config(
-            in_features=dim,
-            out_features=vocab_size,
-            param_init=_output_linear_init(dim),
-        ),
-        rope=RoPE.Config(
-            dim=rope_dim,
-            max_seq_len=4096 * 4,
-            theta=10000.0,
-            backend="complex",
-            scaling="yarn",
-            rope_factor=40.0,
-            beta_fast=32.0,
-            beta_slow=1.0,
-            original_seq_len=4096,
-        ),
-        layers=layers,
-    )
-
-
-def _16b(
-    attn_backend: str,
-    moe_comm_backend: str,
-    non_blocking_capacity_factor: float | None = None,
-) -> DeepSeekV3Model.Config:
-    dim = 2048
-    n_layers = 27
-    vocab_size = 102400
-    n_heads = 16
-    moe_hidden_dim = 1408
-    num_shared_experts = 2
-    dense_hidden_dim = 10944
+    dense_hidden_dim = 7168
     rope_dim = 64
     num_experts = 64
     n_dense_layers = 1
@@ -339,73 +274,7 @@ def _16b(
         n_dense_layers=n_dense_layers,
         dim=dim,
         n_heads=n_heads,
-        q_lora_rank=0,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=rope_dim,
-        v_head_dim=128,
-        mscale=0.70,
-        dense_hidden_dim=dense_hidden_dim,
-        moe_hidden_dim=moe_hidden_dim,
-        num_experts=num_experts,
-        num_shared_experts=num_shared_experts,
-        router_top_k=6,
-        router_score_func="softmax",
-        score_before_experts=False,
-        attn_backend=attn_backend,
-        moe_comm_backend=moe_comm_backend,
-        non_blocking_capacity_factor=non_blocking_capacity_factor,
-    )
-    return DeepSeekV3Model.Config(
-        vocab_size=vocab_size,
-        dim=dim,
-        tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
-        ),
-        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        lm_head=Linear.Config(
-            in_features=dim,
-            out_features=vocab_size,
-            param_init=_output_linear_init(dim),
-        ),
-        rope=RoPE.Config(
-            dim=rope_dim,
-            max_seq_len=4096 * 4,
-            theta=10000.0,
-            backend="complex",
-            scaling="yarn",
-            rope_factor=40.0,
-            beta_fast=32.0,
-            beta_slow=1.0,
-            original_seq_len=4096,
-        ),
-        layers=layers,
-    )
-
-
-def _236b(
-    attn_backend: str,
-    moe_comm_backend: str,
-    non_blocking_capacity_factor: float | None = None,
-) -> DeepSeekV3Model.Config:
-    dim = 5120
-    n_layers = 60
-    vocab_size = 102400
-    n_heads = 128
-    q_lora_rank = 1536
-    moe_hidden_dim = 1536
-    num_shared_experts = 2
-    dense_hidden_dim = 12288
-    rope_dim = 64
-    num_experts = 160
-    n_dense_layers = 1
-
-    layers = _build_dsv3_layers(
-        n_layers=n_layers,
-        n_dense_layers=n_dense_layers,
-        dim=dim,
-        n_heads=n_heads,
-        q_lora_rank=q_lora_rank,
+        q_lora_rank=1536,
         kv_lora_rank=512,
         qk_nope_head_dim=128,
         qk_rope_head_dim=rope_dim,
@@ -416,16 +285,15 @@ def _236b(
         num_experts=num_experts,
         num_shared_experts=num_shared_experts,
         router_top_k=6,
-        router_score_func="softmax",
-        router_num_expert_groups=8,
-        router_num_limited_groups=3,
-        router_route_scale=16.0,
+        router_score_func="sigmoid",
+        router_route_scale=2.5,
+        router_route_norm=True,
         score_before_experts=False,
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
     )
-    return DeepSeekV3Model.Config(
+    return DeepSeekV3CustomModel.Config(
         vocab_size=vocab_size,
         dim=dim,
         tok_embeddings=Embedding.Config(
@@ -439,11 +307,11 @@ def _236b(
         ),
         rope=RoPE.Config(
             dim=rope_dim,
-            max_seq_len=4096 * 4,
+            max_seq_len=4096,
             theta=10000.0,
             backend="complex",
             scaling="yarn",
-            rope_factor=40.0,
+            rope_factor=1.0,
             beta_fast=32.0,
             beta_slow=1.0,
             original_seq_len=4096,
@@ -452,152 +320,8 @@ def _236b(
     )
 
 
-def _671b(
-    attn_backend: str,
-    moe_comm_backend: str,
-    non_blocking_capacity_factor: float | None = None,
-) -> DeepSeekV3Model.Config:
-    dim = 7168
-    n_layers = 61
-    vocab_size = 129280
-    n_heads = 128
-    q_lora_rank = 1536
-    moe_hidden_dim = 2048
-    num_shared_experts = 1
-    dense_hidden_dim = 18432
-    rope_dim = 64
-    num_experts = 256
-    n_dense_layers = 3
-
-    layers = _build_dsv3_layers(
-        n_layers=n_layers,
-        n_dense_layers=n_dense_layers,
-        dim=dim,
-        n_heads=n_heads,
-        q_lora_rank=q_lora_rank,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=rope_dim,
-        v_head_dim=128,
-        mscale=1.0,
-        dense_hidden_dim=dense_hidden_dim,
-        moe_hidden_dim=moe_hidden_dim,
-        num_experts=num_experts,
-        num_shared_experts=num_shared_experts,
-        router_top_k=8,
-        router_score_func="sigmoid",
-        router_num_expert_groups=8,
-        router_num_limited_groups=4,
-        router_route_scale=2.5,
-        router_route_norm=True,
-        score_before_experts=False,
-        attn_backend=attn_backend,
-        moe_comm_backend=moe_comm_backend,
-        non_blocking_capacity_factor=non_blocking_capacity_factor,
-    )
-    return DeepSeekV3Model.Config(
-        vocab_size=vocab_size,
-        dim=dim,
-        tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
-        ),
-        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        lm_head=Linear.Config(
-            in_features=dim,
-            out_features=vocab_size,
-            param_init=_output_linear_init(dim),
-        ),
-        rope=RoPE.Config(
-            dim=rope_dim,
-            max_seq_len=4096 * 4,
-            theta=10000.0,
-            backend="complex",
-            scaling="yarn",
-            rope_factor=40.0,
-            beta_fast=32.0,
-            beta_slow=1.0,
-            original_seq_len=4096,
-        ),
-        layers=layers,
-    )
-
-
-
-
-def _500m(
-    attn_backend: str,
-    moe_comm_backend: str,
-    non_blocking_capacity_factor: float | None = None,
-) -> DeepSeekV3Model.Config:
-    dim = 768
-    n_layers = 10
-    vocab_size = 128815
-    n_heads = 12
-    moe_hidden_dim = 512
-    num_shared_experts = 1
-    dense_hidden_dim = 4096
-    rope_dim = 64
-    num_experts = 24
-    n_dense_layers = 2
-
-    layers = _build_dsv3_layers(
-        n_layers=n_layers,
-        n_dense_layers=n_dense_layers,
-        dim=dim,
-        n_heads=n_heads,
-        q_lora_rank=768,
-        kv_lora_rank=256,
-        qk_nope_head_dim=64,
-        qk_rope_head_dim=rope_dim,
-        v_head_dim=64,
-        mscale=0.70,
-        dense_hidden_dim=dense_hidden_dim,
-        moe_hidden_dim=moe_hidden_dim,
-        num_experts=num_experts,
-        num_shared_experts=num_shared_experts,
-        router_top_k=4,
-        router_score_func="sigmoid",
-        router_num_expert_groups=4,
-        router_num_limited_groups=2,
-        router_route_scale=2.5,
-        router_route_norm=True,
-        score_before_experts=False,
-        attn_backend=attn_backend,
-        moe_comm_backend=moe_comm_backend,
-        non_blocking_capacity_factor=non_blocking_capacity_factor,
-    )
-    return DeepSeekV3Model.Config(
-        vocab_size=vocab_size,
-        dim=dim,
-        tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
-        ),
-        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        lm_head=Linear.Config(
-            in_features=dim,
-            out_features=vocab_size,
-            param_init=_output_linear_init(dim),
-        ),
-        rope=RoPE.Config(
-            dim=rope_dim,
-            max_seq_len=8192,
-            theta=10000.0,
-            backend="complex",
-            scaling="yarn",
-            rope_factor=40.0,
-            beta_fast=32.0,
-            beta_slow=1.0,
-            original_seq_len=8192,
-        ),
-        layers=layers,
-    )
-
-deepseekv3_configs = {
-    "debugmodel": _debugmodel,
-    "16B": _16b,
-    "236B": _236b,
-    "500M": _500m,
-    "671B": _671b,
+deepseekv3_custom_configs = {
+    "3B": _3b,
 }
 
 
@@ -608,7 +332,7 @@ def model_registry(
     non_blocking_capacity_factor: float | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
-    config = deepseekv3_configs[flavor](
+    config = deepseekv3_custom_configs[flavor](
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
@@ -618,11 +342,11 @@ def model_registry(
         for c in converters:
             c.build().convert(config)
     return ModelSpec(
-        name="deepseek_v3",
+        name="deepseek_v3_custom",
         flavor=flavor,
         model=config,
-        parallelize_fn=parallelize_deepseekv3,
-        pipelining_fn=pipeline_llm,
+        parallelize_fn=parallelize_deepseekv3_custom,
+        pipelining_fn=None,
         post_optimizer_build_fn=register_moe_load_balancing_hook,
-        state_dict_adapter=DeepSeekV3StateDictAdapter,
+        state_dict_adapter=DeepSeekV3CustomStateDictAdapter,
     )

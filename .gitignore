@@ -52,3 +52,6 @@ CLAUDE_CONTEXT/
 
 # Lychee (link checker) cache
 .lycheecache
+
+# CodeGraph MCP Index Cache
+.codegraph

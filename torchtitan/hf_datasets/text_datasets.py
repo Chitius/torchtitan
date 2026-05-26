@@ -50,6 +50,11 @@ DATASETS = {
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
     ),
+    "fineweb_edu_50k": DatasetConfig(
+        path="/home/public/liuyichuan/data/fineweb_edu_50k.parquet",
+        loader=lambda path: load_dataset("parquet", data_files=path, split="train"),
+        sample_processor=_process_c4_text,
+    ),
 }
 
 

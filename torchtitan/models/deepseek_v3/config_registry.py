@@ -75,6 +75,42 @@ def deepseek_v3_debugmodel_flex_attn_ep() -> Trainer.Config:
     return config
 
 
+
+
+def deepseek_v3_500m() -> Trainer.Config:
+    return Trainer.Config(
+        loss=ChunkedCELoss.Config(),
+        hf_assets_path="/home/public/liuyichuan/models/custom/deepseek_v3_500m",
+        metrics=MetricsProcessor.Config(
+            log_freq=1,
+            peak_flops=989e12,  # Uncomment to override MFU calculation for H200
+        ),
+        model_spec=model_registry("500M", attn_backend="flex"),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="fineweb_edu_50k"),
+        optimizer=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=100,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        training=TrainingConfig(
+            local_batch_size=2,
+            seq_len=2048,
+            steps=5000,
+        ),
+        parallelism=ParallelismConfig(
+            expert_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(
+            interval=100,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=ActivationCheckpointConfig(
+            mode="selective",
+        ),
+    )
+
 def deepseek_v3_16b() -> Trainer.Config:
     return Trainer.Config(
         loss=ChunkedCELoss.Config(),
