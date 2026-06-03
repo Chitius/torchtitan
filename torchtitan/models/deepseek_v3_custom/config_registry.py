@@ -23,8 +23,7 @@ from torchtitan.components.loss import ChunkedCELoss
 _NUM_MTP = 1
 _MTP_WEIGHT = 0.3
 _EP_DEGREE = 1
-_DATASET = "fineweb_edu_50k"
-
+_DATASET = "slimpajama"
 
 def _make_loss():
     """When MTP is disabled, use ChunkedCELoss for lower peak memory."""
@@ -44,7 +43,7 @@ def deepseek_v3_custom_500m() -> Trainer.Config:
         hf_assets_path="tests/assets/deepseek_v3",
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry(
-            "500M", attn_backend="sdpa",
+            "500M", attn_backend="flex",
             num_mtp_modules=_NUM_MTP, seq_aux_loss_coeff=_AUX_LOSS_COEFF,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(dataset=_DATASET),
@@ -62,7 +61,7 @@ def deepseek_v3_custom_500m() -> Trainer.Config:
         training=TrainingConfig(
             local_batch_size=1,
             global_batch_size=16,
-            seq_len=base_seq_len + _NUM_MTP,
+            seq_len=base_seq_len,
             steps=100,
             max_norm=1.0,
             dtype="bfloat16",
@@ -91,7 +90,7 @@ def deepseek_v3_custom_3b() -> Trainer.Config:
         hf_assets_path="tests/assets/deepseek_v3",
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry(
-            "3B", attn_backend="sdpa",
+            "3B", attn_backend="flex",
             num_mtp_modules=_NUM_MTP, seq_aux_loss_coeff=_AUX_LOSS_COEFF,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(dataset=_DATASET),
@@ -104,7 +103,7 @@ def deepseek_v3_custom_3b() -> Trainer.Config:
         ),
         training=TrainingConfig(
             local_batch_size=8,
-            seq_len=base_seq_len + _NUM_MTP,
+            seq_len=base_seq_len,
             steps=95368,
             dtype="bfloat16",
             mixed_precision_param="bfloat16",
