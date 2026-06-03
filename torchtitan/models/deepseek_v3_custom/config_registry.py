@@ -33,9 +33,7 @@ def _make_loss():
     return ChunkedCELoss.Config()
 
 
-def _aux_coeff():
-    """Enable seq-level aux loss when EP > 1 for better load balancing."""
-    return 1e-4 if _EP_DEGREE > 1 else None
+_AUX_LOSS_COEFF = 1e-4
 
 
 def deepseek_v3_custom_500m() -> Trainer.Config:
@@ -46,8 +44,8 @@ def deepseek_v3_custom_500m() -> Trainer.Config:
         hf_assets_path="tests/assets/deepseek_v3",
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry(
-            "500M", attn_backend="flex",
-            num_mtp_modules=_NUM_MTP, seq_aux_loss_coeff=_aux_coeff(),
+            "500M", attn_backend="sdpa",
+            num_mtp_modules=_NUM_MTP, seq_aux_loss_coeff=_AUX_LOSS_COEFF,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(dataset=_DATASET),
         optimizer=OptimizersContainer.Config(
@@ -94,7 +92,7 @@ def deepseek_v3_custom_3b() -> Trainer.Config:
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry(
             "3B", attn_backend="sdpa",
-            num_mtp_modules=_NUM_MTP, seq_aux_loss_coeff=_aux_coeff(),
+            num_mtp_modules=_NUM_MTP, seq_aux_loss_coeff=_AUX_LOSS_COEFF,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(dataset=_DATASET),
         optimizer=OptimizersContainer.Config(lr=9e-4),
