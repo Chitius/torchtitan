@@ -323,13 +323,21 @@ class DeepSeekV3CustomModel(Decoder):
             positions[:, :seq_len] if positions is not None else None
         )
 
-        # When MTP is enabled, the precomputed attention masks are sized for
-        # the full input (seq_len + num_mtp_modules). Compute masks for the
-        # actual prediction sequence length instead.
+        # When MTP is enabled, precomputed attention masks are sized for
+        # the full input. For mask-based backends (Flex/Varlen), recompute
+        # masks at the prediction seq_len. SDPA uses is_causal=True
+        # internally and passes None as mask.
+        main_masks = attention_masks
         if self.num_mtp_modules > 0 and main_positions is not None:
-            main_masks = self.get_attention_masks(main_positions)
-        else:
-            main_masks = attention_masks
+            attn_cfg = self.config.layers[0].attention
+            inner = attn_cfg.inner_attention
+            from torchtitan.models.common.attention import (
+                FlexAttention,
+                VarlenAttention,
+            )
+
+            if isinstance(inner, (FlexAttention.Config, VarlenAttention.Config)):
+                main_masks = self.get_attention_masks(main_positions)
 
         # Pass through main transformer layers.
         for layer_id in range(self.n_main_layers):
