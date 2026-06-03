@@ -92,9 +92,7 @@ class MTPLoss(BaseLoss):
         for i in range(1, self.num_mtp_modules + 1):
             key = f"mtp_{i}"
             mtp_ce = self._ce_accum.get(key, 0.0)
-            contribs[f"mtp_{i}_loss"] = (
-                self.mtp_loss_weight * mtp_ce / gv
-            )
+            contribs[f"mtp_{i}_loss"] = mtp_ce / gv
         return contribs
 
     def __call__(self, pred, labels, global_valid_tokens=None):

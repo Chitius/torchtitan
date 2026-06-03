@@ -876,6 +876,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             for k, v in mtp_contribs.items():
                 extra_metrics[f"loss_metrics/{k}"] = v
 
+        # Correct global_avg_loss so that aux_loss contributes at the global-mean
+        # scale rather than the global-sum scale.  CE/MTP losses are already
+        # averaged by global_valid_tokens inside the loss fn; aux_loss is a raw
+        # per-microbatch scalar, so dist_sum() accumulates it across all ranks
+        # and microbatches.  Subtract the total sum and add back the global mean
+        # so that loss ≈ main + mtp + aux becomes numerically consistent.
+        if self._last_step_aux_losses:
+            total_local_aux = sum(self._last_step_aux_losses)
+            if parallel_dims.dp_cp_enabled:
+                total_global_aux = float(
+                    dist_utils.dist_sum(
+                        torch.tensor(total_local_aux, device=self.device), loss_mesh
+                    )
+                )
+            else:
+                total_global_aux = total_local_aux
+            global_avg_loss = (
+                global_avg_loss
+                - total_global_aux
+                + extra_metrics["loss_metrics/moe_aux_loss"]
+            )
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
