@@ -543,7 +543,7 @@ class MetricsProcessor(Configurable):
                     for k in mtp_keys
                 ]
                 mtp_loss_str = (
-                    f"  {color.yellow}[{', '.join(parts)}]{color.green}"
+                    f"  {color.yellow}{', '.join(parts)}{color.green}"
                 )
         logger.info(
             f"{color.red}step: {step:2}  "

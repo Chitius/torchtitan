@@ -77,6 +77,7 @@ class MTPLoss(BaseLoss):
 
     def _compute_mtp_loss(self, preds, labels):
         seq_len = preds[0].shape[1]
+        n_tokens = preds[0].shape[0] * seq_len
         main_loss = self.fn(preds[0], labels[:, :seq_len])
 
         mtp_loss_sum = torch.tensor(
@@ -87,7 +88,9 @@ class MTPLoss(BaseLoss):
             end_idx = i + seq_len
             loss_i = self.fn(pred, labels[:, i:end_idx]) / self.num_mtp_modules
             mtp_loss_sum = mtp_loss_sum + loss_i
+            # Report per-token loss so the value is comparable to the
+            # console "loss" field (which is already divided by valid tokens).
             self._last_component_losses[f"mtp_{i}_loss"] = float(
-                loss_i.detach().item()
+                (loss_i / n_tokens).detach().item()
             )
         return main_loss + mtp_loss_sum * self.mtp_loss_weight
