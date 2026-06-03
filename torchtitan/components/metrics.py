@@ -526,28 +526,36 @@ class MetricsProcessor(Configurable):
 
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+
+        # Collect loss decomposition for display.
         aux_loss_str = ""
         if extra_metrics and "loss_metrics/moe_aux_loss" in extra_metrics:
             aux_loss_str = (
                 f"  {color.yellow}aux_loss: {extra_metrics['loss_metrics/moe_aux_loss']:.6f}"
             )
+
+        main_loss_str = ""
         mtp_loss_str = ""
         if extra_metrics:
+            main_val = extra_metrics.get("loss_metrics/main_loss")
             mtp_keys = sorted(
                 k for k in extra_metrics
                 if k.startswith("loss_metrics/mtp_") and k.endswith("_loss")
             )
-            if mtp_keys:
-                parts = [
+            if main_val is not None or mtp_keys or aux_loss_str:
+                parts = []
+                if main_val is not None:
+                    parts.append(f"main={main_val:.2f}")
+                parts.extend(
                     f"{k.split('/', 1)[-1]}={extra_metrics[k]:.2f}"
                     for k in mtp_keys
-                ]
-                mtp_loss_str = (
+                )
+                main_loss_str = (
                     f"  {color.yellow}{', '.join(parts)}{color.green}"
                 )
         logger.info(
             f"{color.red}step: {step:2}  "
-            f"{color.green}loss: {global_avg_loss:8.5f}{aux_loss_str}{mtp_loss_str}  "
+            f"{color.green}loss: {global_avg_loss:8.5f}{aux_loss_str}{main_loss_str}  "
             f"{color.orange}grad_norm: {grad_norm:7.4f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
