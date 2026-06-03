@@ -18,16 +18,24 @@ from torchtitan.trainer import Trainer
 
 from . import model_registry
 from .loss import MTPLoss
+from torchtitan.components.loss import ChunkedCELoss
 
 _NUM_MTP = 1
 _MTP_WEIGHT = 0.3
+
+
+def _make_loss():
+    """When MTP is disabled, use ChunkedCELoss for lower peak memory."""
+    if _NUM_MTP > 0:
+        return MTPLoss.Config(num_mtp_modules=_NUM_MTP, mtp_loss_weight=_MTP_WEIGHT)
+    return ChunkedCELoss.Config()
 
 
 def deepseek_v3_custom_500m() -> Trainer.Config:
     """500M config with MTP=1, bfloat16, FSDP2 DP=2."""
     base_seq_len = 2048
     return Trainer.Config(
-        loss=MTPLoss.Config(num_mtp_modules=_NUM_MTP, mtp_loss_weight=_MTP_WEIGHT),
+        loss=_make_loss(),
         hf_assets_path="/home/public/liuyichuan/models/custom/deepseek_v3_500m",
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry("500M", attn_backend="flex", num_mtp_modules=_NUM_MTP),
@@ -72,7 +80,7 @@ def deepseek_v3_custom_500m_ep2() -> Trainer.Config:
     Let dp_shard be auto-computed to account for EP splitting."""
     base_seq_len = 2048
     return Trainer.Config(
-        loss=MTPLoss.Config(num_mtp_modules=_NUM_MTP, mtp_loss_weight=_MTP_WEIGHT),
+        loss=_make_loss(),
         hf_assets_path="/home/public/liuyichuan/models/custom/deepseek_v3_500m",
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry(
@@ -119,7 +127,7 @@ def deepseek_v3_custom_3b() -> Trainer.Config:
     """3B config with MTP=1, bfloat16."""
     base_seq_len = 4096
     return Trainer.Config(
-        loss=MTPLoss.Config(num_mtp_modules=_NUM_MTP, mtp_loss_weight=_MTP_WEIGHT),
+        loss=_make_loss(),
         hf_assets_path="/home/public/liuyichuan/models/custom/deepseek_v3_3b",
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry("3B", attn_backend="sdpa", num_mtp_modules=_NUM_MTP),
