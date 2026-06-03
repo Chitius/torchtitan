@@ -323,6 +323,7 @@ def _500m(
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
     num_mtp_modules: int = 0,
+    seq_aux_loss_coeff: float | None = None,
 ) -> DeepSeekV3CustomModel.Config:
     dim = 768
     n_layers = 10
@@ -361,6 +362,7 @@ def _500m(
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         num_mtp_modules=num_mtp_modules,
+        seq_aux_loss_coeff=seq_aux_loss_coeff,
     )
     return DeepSeekV3CustomModel.Config(
         vocab_size=vocab_size,
@@ -391,6 +393,7 @@ def _3b(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     num_mtp_modules: int = 0,
+    seq_aux_loss_coeff: float | None = None,
 ) -> DeepSeekV3CustomModel.Config:
     """DeepSeek-V3 3B preset"""
     dim = 1280
@@ -428,6 +431,7 @@ def _3b(
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         num_mtp_modules=num_mtp_modules,
+        seq_aux_loss_coeff=seq_aux_loss_coeff,
     )
     return DeepSeekV3CustomModel.Config(
         vocab_size=vocab_size,
@@ -470,12 +474,14 @@ def model_registry(
     non_blocking_capacity_factor: float | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
     num_mtp_modules: int = 0,
+    seq_aux_loss_coeff: float | None = None,
 ) -> ModelSpec:
     config = deepseekv3_custom_configs[flavor](
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         num_mtp_modules=num_mtp_modules,
+        seq_aux_loss_coeff=seq_aux_loss_coeff,
     )
     if converters is not None:
         validate_converter_order(converters)

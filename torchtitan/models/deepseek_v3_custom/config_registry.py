@@ -109,13 +109,15 @@ def deepseek_v3_custom_500m_mtp() -> Trainer.Config:
 
 
 def deepseek_v3_custom_500m_ep2() -> Trainer.Config:
-    """500M config with EP=2 (no MTP). Loss-free load balancing only.
+    """500M config with EP=2 (no MTP) + seq_aux_loss.
     Let dp_shard be auto-computed to account for EP splitting."""
     return Trainer.Config(
         loss=ChunkedCELoss.Config(),
         hf_assets_path="/home/public/liuyichuan/models/custom/deepseek_v3_500m",
         metrics=MetricsProcessor.Config(log_freq=1),
-        model_spec=model_registry("500M", attn_backend="flex"),
+        model_spec=model_registry(
+            "500M", attn_backend="flex", seq_aux_loss_coeff=1e-4
+        ),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="fineweb_edu_50k"),
         optimizer=OptimizersContainer.Config(
             lr=8.6e-4,

@@ -471,7 +471,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
         self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
 
-        # MoE auxiliary loss is not yet supported with Pipeline Parallelism or Expert Parallelism.
+        # MoE auxiliary loss is not yet supported with Pipeline Parallelism,
+        # or with Expert Parallelism + Tensor Parallelism combined.
+        # EP alone (without TP) is safe because the router input is Replicate.
         from torchtitan.models.common.moe import MoE
         for model_part in self.model_parts:
             for module in model_part.modules():
@@ -485,11 +487,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                             "is not supported with Pipeline Parallelism. "
                             "Please disable Pipeline Parallel or auxiliary loss."
                         )
-                    if parallel_dims.ep_enabled:
+                    if parallel_dims.ep_enabled and parallel_dims.tp_enabled:
                         raise RuntimeError(
                             "MoE auxiliary loss (aux_loss_coeff / seq_aux_loss_coeff) "
-                            "is not supported with Expert Parallelism. "
-                            "Please disable Expert Parallel or auxiliary loss."
+                            "is not supported with EP + TP combined (router sees Shard "
+                            "input, not Replicate). Use EP alone, or disable TP/aux loss."
                         )
 
         # Build validator if validation is configured
