@@ -92,7 +92,7 @@ class LocalTokenDispatcher(Configurable):
         flat_indices = selected_experts_indices.view(-1)
         num_tokens_per_expert = torch.bincount(
             flat_indices, minlength=self.num_experts
-        ).float()
+        )
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
@@ -297,8 +297,8 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
                 .sum(dim=1)
                 .to(torch.device("cpu"), non_blocking=False)
             )
-            input_splits_list = input_splits.tolist()
-            output_splits_list = output_splits.tolist()
+            input_splits_list = [int(x) for x in input_splits.tolist()]
+            output_splits_list = [int(x) for x in output_splits.tolist()]
 
         # All-to-all dispatch tokens to EP ranks
         routed_input = all_to_all_single_autograd(

@@ -531,9 +531,23 @@ class MetricsProcessor(Configurable):
             aux_loss_str = (
                 f"  {color.yellow}aux_loss: {extra_metrics['loss_metrics/moe_aux_loss']:.6f}"
             )
+        mtp_loss_str = ""
+        if extra_metrics:
+            mtp_keys = sorted(
+                k for k in extra_metrics
+                if k.startswith("loss_metrics/mtp_") and k.endswith("_loss")
+            )
+            if mtp_keys:
+                parts = [
+                    f"{k.split('/', 1)[-1]}={extra_metrics[k]:.2f}"
+                    for k in mtp_keys
+                ]
+                mtp_loss_str = (
+                    f"  {color.yellow}[{', '.join(parts)}]{color.green}"
+                )
         logger.info(
             f"{color.red}step: {step:2}  "
-            f"{color.green}loss: {global_avg_loss:8.5f}{aux_loss_str}  "
+            f"{color.green}loss: {global_avg_loss:8.5f}{aux_loss_str}{mtp_loss_str}  "
             f"{color.orange}grad_norm: {grad_norm:7.4f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "

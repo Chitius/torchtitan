@@ -80,8 +80,6 @@ class Attention(BaseAttention):
             self.q_norm = config.q_norm.build()
             self.wq_b = config.wq_b.build()
 
-        # TODO(fegin): revisit
-        # https://github.com/pytorch/torchtitan/pull/2785#discussion_r3034078575
         self.wkv_a = config.wkv_a.build()
         self.kv_norm = config.kv_norm.build()
         self.wkv_b = config.wkv_b.build()
@@ -103,7 +101,6 @@ class Attention(BaseAttention):
     ):
         bsz, seqlen, _ = x.size()
 
-        # Query projection
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
@@ -116,7 +113,6 @@ class Attention(BaseAttention):
         q_pe = apply_rotary_emb_single_complex(q_pe, freqs_cis, positions)
         q = torch.cat([q_nope, q_pe], dim=-1)
 
-        # Key-value projection
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
@@ -135,9 +131,7 @@ class Attention(BaseAttention):
 
 
 class DeepSeekV3CustomTransformerBlock(TransformerBlock):
-    """
-    DeepSeek V3 Transformer block with attention and feed-forward layers.
-    """
+    """DeepSeek V3 Transformer block with attention and feed-forward layers."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
@@ -174,16 +168,72 @@ class DeepSeekV3CustomTransformerBlock(TransformerBlock):
         return x
 
 
+class MTPModule(Module):
+    """Multi-Token Prediction module.
+
+    Merges an offset input embedding with the previous prediction's hidden
+    state, then passes through a standard transformer block.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        transformer_block: DeepSeekV3CustomTransformerBlock.Config
+        dim: int
+        eps: float = 1e-6
+        enorm: RMSNorm.Config | None = None
+        hnorm: RMSNorm.Config | None = None
+        eh_proj: Linear.Config | None = None
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.dim = config.dim
+        _norm_cfg = RMSNorm.Config(
+            normalized_shape=config.dim, eps=config.eps,
+            param_init={"weight": nn.init.ones_},
+        )
+        self.enorm = config.enorm.build() if config.enorm is not None else _norm_cfg.build()
+        self.hnorm = config.hnorm.build() if config.hnorm is not None else _norm_cfg.build()
+        _eh_proj_cfg = Linear.Config(
+            in_features=2 * config.dim, out_features=config.dim, bias=False,
+            param_init={
+                "weight": nn.init.trunc_normal_,
+            },
+        )
+        self.eh_proj = config.eh_proj.build() if config.eh_proj is not None else _eh_proj_cfg.build()
+        self.transformer_block = config.transformer_block.build()
+
+    # Proxy attributes for FSDP's EP-aware shard_placement_fn.
+    @property
+    def moe_enabled(self):
+        return self.transformer_block.moe_enabled
+
+    @property
+    def moe(self):
+        return self.transformer_block.moe
+
+    def forward(
+        self,
+        input_offset: torch.Tensor,
+        prev_embed: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
+    ):
+        input_offset = self.enorm(input_offset)
+        prev_embed = self.hnorm(prev_embed)
+        h = torch.cat([input_offset, prev_embed], dim=-1)
+        h = self.eh_proj(h)
+        return self.transformer_block(h, freqs_cis, attention_masks, positions)
+
+
 class DeepSeekV3CustomModel(Decoder):
-    """
-    DeepSeek-V3 Transformer model with attention and feed-forward layers.
-    Simplified variant: supports only FSDP/HSDP/DDP (no TP/CP/EP/PP).
-    """
+    """DeepSeek-V3 model with optional MTP and EP support."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         dim: int = 2048
         vocab_size: int = 102400
+        num_mtp_modules: int = 0
 
         def update_from_config(
             self,
@@ -202,27 +252,36 @@ class DeepSeekV3CustomModel(Decoder):
                 )
             self.rope = dataclasses.replace(self.rope, max_seq_len=seq_len)
 
-            # Sync rope fields to attention for all layers.
-            # Mutate in-place — simpler than replacing each config in the list.
+            # Sync rope fields to all attention configs.
             for layer_cfg in self.layers:
-                assert isinstance(layer_cfg.attention, Attention.Config)
-                layer_cfg.attention.rope_max_seq_len = seq_len
-                layer_cfg.attention.rope_factor = self.rope.rope_factor
-                layer_cfg.attention.rope_original_seq_len = self.rope.original_seq_len
+                attn_cfg = _get_attention_config(layer_cfg)
+                if attn_cfg is not None:
+                    attn_cfg.rope_max_seq_len = seq_len
+                    attn_cfg.rope_factor = self.rope.rope_factor
+                    attn_cfg.rope_original_seq_len = self.rope.original_seq_len
 
+            # Set debug flags on MoE routers.
             for layer_cfg in self.layers:
-                if layer_cfg.moe is not None:
-                    layer_cfg.moe.router._debug_force_load_balance = (
+                moe_cfg = _get_moe_config(layer_cfg)
+                if moe_cfg is not None:
+                    moe_cfg.router._debug_force_load_balance = (
                         debug.moe_force_load_balance
                     )
 
-            # NOTE: TP/CP/EP/PP checks and sharding config injection are removed
-            # because deepseek_v3_custom only supports FSDP/HSDP/DDP.
+            # Setup EP sharding configs when expert parallelism is enabled.
+            if parallelism.expert_parallel_degree > 1:
+                from torchtitan.models.deepseek_v3_custom.sharding import (
+                    set_deepseek_v3_custom_sharding_config,
+                )
+
+                set_deepseek_v3_custom_sharding_config(
+                    self,
+                    enable_ep=True,
+                )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-
             assert isinstance(self.layers[0].attention, Attention.Config)
             return get_moe_model_nparams_and_flops(
                 self,
@@ -233,3 +292,117 @@ class DeepSeekV3CustomModel(Decoder):
                 + self.layers[0].attention.v_head_dim,
                 seq_len,
             )
+
+    # Set by trainer when ChunkedCELoss is used, so lm_head is applied
+    # per-chunk inside the loss instead of in forward().
+    _skip_lm_head: bool = False
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.num_mtp_modules = config.num_mtp_modules
+        n_total = len(config.layers)
+        self.n_main_layers = n_total - config.num_mtp_modules
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        attention_masks: AttentionMasksType | None = None,
+        positions: torch.Tensor | None = None,
+    ):
+        if self.num_mtp_modules > 0:
+            seq_len = tokens.shape[1] - self.num_mtp_modules
+        else:
+            seq_len = tokens.shape[1]
+
+        h = (
+            self.tok_embeddings(tokens[:, :seq_len])
+            if self.tok_embeddings is not None
+            else tokens[:, :seq_len]
+        )
+        main_positions = (
+            positions[:, :seq_len] if positions is not None else None
+        )
+
+        # When MTP is enabled, the precomputed attention masks are sized for
+        # the full input (seq_len + num_mtp_modules). Compute masks for the
+        # actual prediction sequence length instead.
+        if self.num_mtp_modules > 0 and main_positions is not None:
+            main_masks = self.get_attention_masks(main_positions)
+        else:
+            main_masks = attention_masks
+
+        # Pass through main transformer layers.
+        for layer_id in range(self.n_main_layers):
+            h = self.layers[str(layer_id)](
+                h, self.freqs_cis, main_masks, main_positions
+            )
+
+        prev_embed = h
+
+        if self.num_mtp_modules == 0:
+            h = self.norm(h) if self.norm is not None else h
+            if self._skip_lm_head:
+                return h
+            output = self.lm_head(h) if self.lm_head is not None else h
+            return output
+
+        # MTP enabled: apply lm_head for all predictions in forward.
+        outputs = []
+        main_out = (
+            self.lm_head(self.norm(h))
+            if self.lm_head is not None
+            else self.norm(h)
+        )
+        outputs.append(main_out)
+
+        for i in range(self.num_mtp_modules):
+            token_offset = tokens[:, i + 1 : i + 1 + seq_len]
+            input_embed = (
+                self.tok_embeddings(token_offset)
+                if self.tok_embeddings is not None
+                else token_offset
+            )
+            mtp_positions = (
+                positions[:, i + 1 : i + 1 + seq_len]
+                if positions is not None
+                else None
+            )
+            mtp_layer = self.layers[str(self.n_main_layers + i)]
+            h = mtp_layer(
+                input_embed,
+                prev_embed,
+                self.freqs_cis,
+                main_masks,
+                mtp_positions,
+            )
+            prev_embed = h
+            mtp_out = (
+                self.lm_head(self.norm(h))
+                if self.lm_head is not None
+                else self.norm(h)
+            )
+            outputs.append(mtp_out)
+
+        return outputs
+
+
+def _get_attention_config(layer_cfg):
+    """Extract Attention.Config from a layer config, handling both
+    regular blocks and MTP-wrapped blocks."""
+    if isinstance(layer_cfg, DeepSeekV3CustomTransformerBlock.Config):
+        if isinstance(layer_cfg.attention, Attention.Config):
+            return layer_cfg.attention
+    if isinstance(layer_cfg, MTPModule.Config):
+        mtp_attn = layer_cfg.transformer_block.attention
+        if isinstance(mtp_attn, Attention.Config):
+            return mtp_attn
+    return None
+
+
+def _get_moe_config(layer_cfg):
+    """Extract MoE.Config from a layer config."""
+    if isinstance(layer_cfg, DeepSeekV3CustomTransformerBlock.Config):
+        return layer_cfg.moe
+    if isinstance(layer_cfg, MTPModule.Config):
+        return layer_cfg.transformer_block.moe
+    return None

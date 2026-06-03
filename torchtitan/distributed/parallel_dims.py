@@ -79,6 +79,12 @@ class ParallelDims:
             f"Invalid parallel dims: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
             f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
         )
+        if ep > 1:
+            efsdp = max(1, dp_shard * cp * tp // ep)
+            assert dp_replicate * efsdp * ep * pp == self.world_size, (
+                f"Invalid parallel dims with EP: dp_replicate({dp_replicate}) * "
+                f"efsdp({efsdp}) * ep({ep}) * pp({pp}) != WORLD_SIZE({self.world_size})"
+            )
 
     def _mesh_exist(self, name: str, degree: int) -> bool:
         if name == "fsdp":
@@ -166,7 +172,7 @@ class ParallelDims:
 
         batch = self.dp_replicate * self.dp_shard
         fsdp = self.dp_shard * self.cp
-        efsdp = fsdp * self.tp // self.ep
+        efsdp = max(1, fsdp * self.tp // self.ep)
 
         self._world_mesh = init_device_mesh(
             device_type, (self.world_size,), mesh_dim_names=("world",)
@@ -253,7 +259,7 @@ class ParallelDims:
             "cp": self.cp,
             "tp": self.tp,
             "ep": self.ep,
-            "efsdp": self.dp_shard * self.cp * self.tp // self.ep,
+            "efsdp": max(1, self.dp_shard * self.cp * self.tp // self.ep),
         }
         if self.full_dtensor:
             expected_sizes["dp_shard"] = self.dp_shard

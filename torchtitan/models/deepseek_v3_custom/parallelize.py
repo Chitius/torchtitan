@@ -30,33 +30,36 @@ def parallelize_deepseekv3_custom(
     ac_config: ActivationCheckpointConfig,
     dump_folder: str,
 ):
-    """
-    Apply activation checkpointing, torch.compile, and data parallelism (FSDP/HSDP/DDP)
-    to the model.
+    """Apply activation checkpointing, torch.compile, data parallelism (FSDP),
+    and optionally expert parallelism to the model.
 
-    deepseek_v3_custom explicitly does NOT support TP, CP, EP, or PP.
+    deepseek_v3_custom supports FSDP/HSDP/DDP + optional EP.
+    TP, CP, and PP are not supported.
     """
-    # Enforce no TP/CP/EP/PP
     if parallel_dims.tp > 1:
         raise ValueError(
-            f"deepseek_v3_custom does not support tensor parallelism (TP). Got TP degree={parallel_dims.tp}."
+            f"deepseek_v3_custom does not support tensor parallelism (TP). "
+            f"Got TP degree={parallel_dims.tp}."
         )
     if parallel_dims.cp > 1:
         raise ValueError(
-            f"deepseek_v3_custom does not support context parallelism (CP). Got CP degree={parallel_dims.cp}."
-        )
-    if parallel_dims.ep > 1:
-        raise ValueError(
-            f"deepseek_v3_custom does not support expert parallelism (EP). Got EP degree={parallel_dims.ep}."
+            f"deepseek_v3_custom does not support context parallelism (CP). "
+            f"Got CP degree={parallel_dims.cp}."
         )
     if parallel_dims.pp > 1:
         raise ValueError(
-            f"deepseek_v3_custom does not support pipeline parallelism (PP). Got PP degree={parallel_dims.pp}."
+            f"deepseek_v3_custom does not support pipeline parallelism (PP). "
+            f"Got PP degree={parallel_dims.pp}."
         )
 
     model_compile_enabled = (
         compile_config.enable and "model" in compile_config.components
     )
+
+    # Distribute MoE expert weights as DTensors on the sparse mesh when EP
+    # is enabled. This must happen before FSDP wrapping.
+    if parallel_dims.ep_enabled:
+        model.parallelize(parallel_dims)
 
     if ac_config.mode != "none":
         apply_ac(
@@ -75,6 +78,15 @@ def parallelize_deepseekv3_custom(
     )
     dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
 
+    edp_mesh = None
+    if parallel_dims.ep_enabled:
+        edp_mesh_names = (
+            ["dp_replicate", "efsdp"]
+            if parallel_dims.dp_replicate_enabled
+            else ["efsdp"]
+        )
+        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+
     apply_fsdp(
         model,
         dp_mesh,
@@ -83,8 +95,8 @@ def parallelize_deepseekv3_custom(
         pp_enabled=False,
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        ep_degree=1,
-        edp_mesh=None,
+        ep_degree=parallel_dims.ep,
+        edp_mesh=edp_mesh,
     )
 
     logger.info("Applied fully_shard to the model")

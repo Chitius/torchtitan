@@ -24,7 +24,12 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .model import Attention, DeepSeekV3CustomModel, DeepSeekV3CustomTransformerBlock
+from .model import (
+    Attention,
+    DeepSeekV3CustomModel,
+    DeepSeekV3CustomTransformerBlock,
+    MTPModule,
+)
 from .parallelize import parallelize_deepseekv3_custom
 from .state_dict_adapter import DeepSeekV3CustomStateDictAdapter
 
@@ -79,12 +84,7 @@ def _make_dsv3_attn_config(
     mscale: float = 1.0,
     attn_backend: str,
 ) -> Attention.Config:
-    """Build a fully-specified DeepSeek V3 MLA Attention.Config.
-
-    All Linear and RMSNorm sub-configs have their dimensional fields set.
-    When q_lora_rank == 0, sets wq (not wq_a/wq_b).
-    When q_lora_rank > 0, sets wq_a/wq_b (not wq).
-    """
+    """Build a fully-specified DeepSeek V3 MLA Attention.Config."""
     inner_attention, mask_type = get_attention_config(attn_backend)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -96,8 +96,6 @@ def _make_dsv3_attn_config(
         )
         wq_a = None
         wq_b = None
-        # q_norm is unused when q_lora_rank == 0 (never built), but the field is
-        # required on Attention.Config so we supply a placeholder.
         q_norm = RMSNorm.Config(normalized_shape=1, param_init=_NORM_INIT)
     else:
         wq = None
@@ -174,14 +172,15 @@ def _build_dsv3_layers(
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None,
     seq_aux_loss_coeff: float | None = None,
+    num_mtp_modules: int = 0,
 ) -> list[TransformerBlock.Config]:
-    """Build the list of per-layer TransformerBlock configs.
+    """Build the list of per-layer configs (main transformer blocks + MTP modules).
 
     Layers with layer_id < n_dense_layers get a dense FeedForward and no MoE.
     Layers with layer_id >= n_dense_layers get a MoE and no FeedForward.
 
-    Router and expert inits are constructed per-layer so depth-scaled
-    initializers are correct for each layer's position.
+    When num_mtp_modules > 0, additional MTPModule configs are appended.
+    MTP layers reuse the architecture of the last MoE main layer.
     """
     layers = []
     for layer_id in range(n_layers):
@@ -237,7 +236,6 @@ def _build_dsv3_layers(
                     w1_param_init=_LINEAR_INIT,
                     w2w3_param_init=_depth_init(layer_id),
                 ),
-                # When loss-based load balancing is enabled, disable loss-free balancing.
                 load_balance_coeff=None if seq_aux_loss_coeff is not None else 1e-3,
                 seq_aux_loss_coeff=seq_aux_loss_coeff,
             )
@@ -253,12 +251,78 @@ def _build_dsv3_layers(
                 moe=moe_cfg,
             )
         )
+
+    # Build MTP module configs, reusing the last MoE layer's architecture.
+    for mtp_id in range(num_mtp_modules):
+        mtp_layer_id = n_layers + mtp_id
+        mtp_attn_cfg = _make_dsv3_attn_config(
+            layer_id=mtp_layer_id,
+            dim=dim,
+            n_heads=n_heads,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            mscale=mscale,
+            attn_backend=attn_backend,
+        )
+        mtp_moe_cfg = make_moe_config(
+            num_experts=num_experts,
+            router=make_router_config(
+                dim=dim,
+                num_experts=num_experts,
+                gate_param_init=_depth_init(mtp_layer_id),
+                top_k=router_top_k,
+                score_func=router_score_func,
+                num_expert_groups=router_num_expert_groups,
+                num_limited_groups=router_num_limited_groups,
+                route_scale=router_route_scale,
+                route_norm=router_route_norm,
+            ),
+            experts=make_experts_config(
+                dim=dim,
+                hidden_dim=moe_hidden_dim,
+                num_experts=num_experts,
+                top_k=router_top_k,
+                param_init=_depth_experts_init(mtp_layer_id),
+                score_before_experts=score_before_experts,
+                comm_backend=moe_comm_backend,
+                non_blocking_capacity_factor=non_blocking_capacity_factor,
+            ),
+            shared_experts=make_ffn_config(
+                dim=dim,
+                hidden_dim=moe_hidden_dim * num_shared_experts,
+                w1_param_init=_LINEAR_INIT,
+                w2w3_param_init=_depth_init(mtp_layer_id),
+            ),
+            load_balance_coeff=None if seq_aux_loss_coeff is not None else 1e-3,
+            seq_aux_loss_coeff=seq_aux_loss_coeff,
+        )
+        mtp_transformer_block = DeepSeekV3CustomTransformerBlock.Config(
+            attention=mtp_attn_cfg,
+            attention_norm=RMSNorm.Config(
+                normalized_shape=dim, param_init=_NORM_INIT
+            ),
+            ffn_norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+            feed_forward=None,
+            moe=mtp_moe_cfg,
+        )
+        layers.append(
+            MTPModule.Config(
+                transformer_block=mtp_transformer_block,
+                dim=dim,
+            )
+        )
+
     return layers
+
 
 def _500m(
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    num_mtp_modules: int = 0,
 ) -> DeepSeekV3CustomModel.Config:
     dim = 768
     n_layers = 10
@@ -296,11 +360,12 @@ def _500m(
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
-        seq_aux_loss_coeff=1e-4,
+        num_mtp_modules=num_mtp_modules,
     )
     return DeepSeekV3CustomModel.Config(
         vocab_size=vocab_size,
         dim=dim,
+        num_mtp_modules=num_mtp_modules,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
@@ -312,22 +377,20 @@ def _500m(
         ),
         rope=RoPE.Config(
             dim=rope_dim,
-            max_seq_len=4096,
+            max_seq_len=8192,
             theta=10000.0,
             backend="complex",
-            scaling="yarn",
-            rope_factor=1.0,
-            beta_fast=32.0,
-            beta_slow=1.0,
-            original_seq_len=4096,
+            scaling="none",
         ),
         layers=layers,
     )
+
 
 def _3b(
     attn_backend: str = "sdpa",
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
+    num_mtp_modules: int = 0,
 ) -> DeepSeekV3CustomModel.Config:
     """DeepSeek-V3 3B preset"""
     dim = 1280
@@ -364,11 +427,12 @@ def _3b(
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
-        seq_aux_loss_coeff=1e-4,
+        num_mtp_modules=num_mtp_modules,
     )
     return DeepSeekV3CustomModel.Config(
         vocab_size=vocab_size,
         dim=dim,
+        num_mtp_modules=num_mtp_modules,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
@@ -394,6 +458,7 @@ def _3b(
 
 
 deepseekv3_custom_configs = {
+    "500M": _500m,
     "3B": _3b,
 }
 
@@ -404,11 +469,13 @@ def model_registry(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
+    num_mtp_modules: int = 0,
 ) -> ModelSpec:
     config = deepseekv3_custom_configs[flavor](
         attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        num_mtp_modules=num_mtp_modules,
     )
     if converters is not None:
         validate_converter_order(converters)
