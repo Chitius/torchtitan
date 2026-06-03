@@ -450,7 +450,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.step = 0
         self.ntokens_seen = 0
         self._last_step_aux_losses: list[float] = []
-        self._last_step_mtp_losses: dict[str, float] = {}
 
         self.checkpointer = config.checkpoint.build(
             dataloader=self.dataloader,
@@ -728,11 +727,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 ):
                     pred = pred.to_local()
                 loss = self.loss_fn(pred, labels, global_valid_tokens)
-                # Collect MTP component losses for metrics logging.
-                if hasattr(self.loss_fn, "_last_component_losses"):
-                    self._last_step_mtp_losses = (
-                        self.loss_fn._last_component_losses.copy()
-                    )
                 del pred
                 # Collect and add MOE auxiliary loss if present.
                 aux_loss = collect_moe_aux_loss(model_parts[0], clear=True)
@@ -782,6 +776,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         self._last_step_aux_losses.clear()
+        if hasattr(self.loss_fn, "reset_ce_accum"):
+            self.loss_fn.reset_ce_accum()
         # Defensively clear any stale auxiliary losses before starting the step.
         for model_part in self.model_parts:
             collect_moe_aux_loss(model_part, clear=True)
@@ -869,10 +865,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 )
             extra_metrics["loss_metrics/moe_aux_loss"] = float(avg_aux_loss)
 
-        # Report MTP component losses if collected during this step.
-        mtp_losses = getattr(self, "_last_step_mtp_losses", None)
-        if mtp_losses:
-            for k, v in mtp_losses.items():
+        # Report MTP component contributions (accumulated over microbatches).
+        if hasattr(self.loss_fn, "get_step_contributions"):
+            mtp_contribs = self.loss_fn.get_step_contributions(global_valid_tokens)
+            if parallel_dims.dp_cp_enabled:
+                mtp_mesh = parallel_dims.get_optional_mesh("loss")
+                for k, v in mtp_contribs.items():
+                    v_tensor = torch.tensor(v, device=self.device)
+                    mtp_contribs[k] = float(dist_utils.dist_sum(v_tensor, mtp_mesh))
+            for k, v in mtp_contribs.items():
                 extra_metrics[f"loss_metrics/{k}"] = v
 
         self.metrics_processor.log(
