@@ -345,7 +345,7 @@ class DeepSeekV3CustomModel(Decoder):
                 h, self.freqs_cis, main_masks, main_positions
             )
 
-        prev_embed = h
+        prev_embed = self.norm(h) if self.norm is not None else h
 
         if self.num_mtp_modules == 0:
             h = self.norm(h) if self.norm is not None else h
@@ -383,12 +383,9 @@ class DeepSeekV3CustomModel(Decoder):
                 main_masks,
                 mtp_positions,
             )
+            h = self.norm(h) if self.norm is not None else h
             prev_embed = h
-            mtp_out = (
-                self.lm_head(self.norm(h))
-                if self.lm_head is not None
-                else self.norm(h)
-            )
+            mtp_out = self.lm_head(h) if self.lm_head is not None else h
             outputs.append(mtp_out)
 
         return outputs
